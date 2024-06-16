@@ -44,6 +44,9 @@ from keras_cv.src.models.stable_diffusion.image_encoder import ImageEncoder
 from keras_cv.src.models.stable_diffusion.text_encoder import TextEncoder
 from keras_cv.src.models.stable_diffusion.text_encoder import TextEncoderV2
 
+import tensorflow as tf
+from capsa_tf import sample, vote, sculpt
+
 MAX_PROMPT_LENGTH = 77
 
 
@@ -66,7 +69,7 @@ class StableDiffusionBase:
         self._image_encoder = None
         self._text_encoder = None
         self._diffusion_model = None
-        self._decoder = None
+        self._decoder = Decoder(self.img_height, self.img_width)
         self._tokenizer = None
 
         self.jit_compile = jit_compile
@@ -137,6 +140,7 @@ class StableDiffusionBase:
         unconditional_guidance_scale=7.5,
         diffusion_noise=None,
         seed=None,
+        decode_multiple = False
     ):
         """Generates an image based on encoded text.
 
@@ -165,6 +169,7 @@ class StableDiffusionBase:
             seed: integer which is used to seed the random generation of
                 diffusion noise, only to be specified if `diffusion_noise` is
                 None.
+            decode_multiple: bool, whether to decode multiple times during the diffusion process. Defaults to False.
 
         Example:
 
@@ -210,6 +215,11 @@ class StableDiffusionBase:
         else:
             latent = self._get_initial_diffusion_noise(batch_size, seed)
 
+        @sample.Wrapper(n_samples=5)
+        @tf.function
+        def decoder_forward(latent):
+            return self._decoder(latent)
+
         # Iterative reverse diffusion stage
         num_timesteps = 1000
         ratio = (
@@ -222,6 +232,8 @@ class StableDiffusionBase:
         alphas, alphas_prev = self._get_initial_alphas(timesteps)
         progbar = keras.utils.Progbar(len(timesteps))
         iteration = 0
+        decoded_list = []
+        risks_list = []
         for index, timestep in list(enumerate(timesteps))[::-1]:
             latent_prev = latent  # Set aside the previous latent vector
             t_emb = self._get_timestep_embedding(timestep, batch_size)
@@ -257,10 +269,21 @@ class StableDiffusionBase:
             iteration += 1
             progbar.update(iteration)
 
+            if decode_multiple and iteration % 5 == 0:
+                decoded,decoded_risk = decoder_forward(latent,return_risk=True)
+                decoded = ((decoded + 1) / 2) * 255
+                decoded = np.clip(decoded, 0, 255).astype("uint8")
+                decoded_list.append(decoded)
+                risks_list.append(decoded_risk.numpy())
+
         # Decoding stage
-        decoded = self.decoder.predict_on_batch(latent)
+        decoded,decoded_risk = decoder_forward(latent,return_risk=True)
         decoded = ((decoded + 1) / 2) * 255
-        return np.clip(decoded, 0, 255).astype("uint8")
+
+        decoded = np.clip(decoded, 0, 255).astype("uint8")
+        decoded_list.append(decoded)
+        risks_list.append(decoded_risk.numpy())
+        return decoded_list,risks_list
 
     def _get_unconditional_context(self):
         unconditional_tokens = ops.convert_to_tensor(
@@ -308,17 +331,6 @@ class StableDiffusionBase:
     def diffusion_model(self):
         pass
 
-    @property
-    def decoder(self):
-        """decoder returns the diffusion image decoder model with pretrained
-        weights. Can be overriden for tasks where the decoder needs to be
-        modified.
-        """
-        if self._decoder is None:
-            self._decoder = Decoder(self.img_height, self.img_width)
-            if self.jit_compile:
-                self._decoder.compile(jit_compile=True)
-        return self._decoder
 
     @property
     def tokenizer(self):
